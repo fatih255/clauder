@@ -1,0 +1,15 @@
+# dependencies (none today, just in case)
+node_modules/
+
+# never commit tokens
+accounts.json
+*.tmp
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

@@ -1,0 +1,11 @@
+{
+  "name": "clauder",
+  "version": "1.0.0",
+  "description": "Launch Claude Code with different accounts' OAuth tokens",
+  "bin": {
+    "clauder": "bin/clauder.js"
+  },
+  "license": "MIT",
+  "private": true,
+  "engines": { "node": ">=18" }
+}
