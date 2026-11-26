@@ -2,8 +2,8 @@ Output docs/add.gif
 
 Set Shell bash
 Set FontSize 15
-Set Width 1020
-Set Height 300
+Set Width 1100
+Set Height 600
 Set Padding 24
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 60ms
@@ -24,7 +24,7 @@ Sleep 600ms
 Type "client work"
 Enter
 Sleep 1.2s
-Type "clauder carol -c"
+Type "clauder carol"
 Sleep 400ms
 Enter
-Sleep 2.5s
+Sleep 7s

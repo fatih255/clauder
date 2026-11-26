@@ -2,8 +2,8 @@ Output docs/bypass.gif
 
 Set Shell bash
 Set FontSize 15
-Set Width 1000
-Set Height 280
+Set Width 1100
+Set Height 600
 Set Padding 24
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 70ms
@@ -29,4 +29,8 @@ Sleep 700ms
 Space
 Sleep 700ms
 Enter
-Sleep 2.5s
+Sleep 1.2s
+Type "clauder alice"
+Sleep 400ms
+Enter
+Sleep 7s

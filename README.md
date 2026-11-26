@@ -130,13 +130,19 @@ turns them back on.
 
 ## Re-recording the demos
 
-The GIFs are made with [VHS](https://github.com/charmbracelet/vhs) inside Docker, using fake
-accounts and a stand-in `claude`, so no real token or email shows up in them. To record them
-again after a UI change, run this from the repo root:
+The GIFs are made with [VHS](https://github.com/charmbracelet/vhs) inside Docker, and each one
+ends with the real Claude Code starting up. The demo accounts hold fake `sk-ant-oat01-demo-*`
+tokens; a small wrapper swaps them for a real token only when `claude` starts, so no real token
+is typed or shown. The email and organization in `clauder list` are fake too, because the real
+`claude auth status` prints them. To record them again after a UI change, run this from the
+repo root with a token from `claude setup-token`:
 
 ```sh
-sh docs/demo/record.sh
+CLAUDER_DEMO_TOKEN=sk-ant-oat01-... sh docs/demo/record.sh
 ```
+
+If `~/.claude/.credentials.json` exists, it is copied into the container (read-only) so
+`clauder me` opens with your own login.
 
 The scripts are in `docs/demo/`.
 
