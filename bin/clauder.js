@@ -151,18 +151,37 @@ function hasExe() {
   return dirs.some(d => d && fs.existsSync(path.join(d, 'claude.exe')));
 }
 
+// ---------- bypass permissions ----------
+
+const BYPASS_FLAG = '--dangerously-skip-permissions';
+
+// Per-account switch. Token accounts keep it on their entry, your own login under "me".
+function getBypass(db, name) {
+  const entry = name === OWN ? db.me : db.accounts[name];
+  return !!(entry && entry.bypass);
+}
+
+function setBypass(db, name, on) {
+  const entry = name === OWN ? (db.me = db.me || {}) : db.accounts[name];
+  if (on) entry.bypass = true;
+  else delete entry.bypass;
+}
+
 function launch(name, claudeArgs) {
   const env = { ...process.env };
   delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  const db = load();
   if (name !== OWN) {
-    const db = load();
     const acc = db.accounts[name];
     if (!acc) die(`no account named "${name}". See: clauder list`);
     env.CLAUDE_CODE_OAUTH_TOKEN = acc.token;
     acc.lastUsedAt = new Date().toISOString();
     save(db);
   }
-  console.error(`> claude (${name})`);
+  // add the flag unless the caller already chose a permission mode
+  const chosen = claudeArgs.some(a => a === BYPASS_FLAG || a.startsWith('--permission-mode'));
+  if (getBypass(db, name) && !chosen) claudeArgs = [BYPASS_FLAG, ...claudeArgs];
+  console.error(`> claude (${name})` + (claudeArgs.includes(BYPASS_FLAG) ? yellow('  ⚠ bypass permissions on') : ''));
   const child = spawn('claude', claudeArgs, {
     stdio: 'inherit',
     env,
@@ -203,8 +222,30 @@ async function cmdAdd(name) {
   console.log(`added: ${name}  ->  clauder ${name}`);
 }
 
+async function cmdBypass(name, value) {
+  if (!name) {
+    if (!(process.stdin.isTTY && process.stdout.isTTY)) die('usage: clauder bypass <name> [on|off]');
+    const db = load();
+    const names = [OWN, ...Object.keys(db.accounts)];
+    const checked = await checkBypass(names, db);
+    if (checked === null) return console.log(dim('cancelled, nothing changed.'));
+    names.forEach(n => setBypass(db, n, checked.has(n)));
+    save(db);
+    const on = names.filter(n => checked.has(n));
+    return console.log('bypass permissions on: ' + (on.length ? yellow(on.join(', ')) : dim('none')));
+  }
+  const db = load();
+  if (name !== OWN && !db.accounts[name]) die(`no account named "${name}". See: clauder list`);
+  if (value && value !== 'on' && value !== 'off') die('use on or off.');
+  const on = value ? value === 'on' : !getBypass(db, name);
+  setBypass(db, name, on);
+  save(db);
+  console.log(`${name}: bypass permissions ` + (on ? yellow('on') + dim(`  (claude starts with ${BYPASS_FLAG})`) : 'off'));
+}
+
 function cmdList() {
-  const accs = load().accounts;
+  const db = load();
+  const accs = db.accounts;
   const names = [OWN, ...Object.keys(accs)];
   const rows = names.map(name => {
     const own = name === OWN;
@@ -219,11 +260,12 @@ function cmdList() {
       { t: name, s: bold(name) },
       own ? 'your own login (no token)' : 'token',
       state,
+      getBypass(db, name) ? { t: '⚠ on', s: yellow('⚠ on') } : { t: 'off', s: dim('off') },
       details.filter(Boolean).join('  '),
     ];
   });
   banner();
-  table(['Account', 'Type', 'Status', 'Details'], rows);
+  table(['Account', 'Type', 'Status', 'Bypass', 'Details'], rows);
   if (names.length === 1) console.log(dim('\n  no token accounts yet. Add one with: clauder add <name>'));
 }
 
@@ -248,72 +290,119 @@ function cmdRename(from, to) {
   console.log(`${from} -> ${to}`);
 }
 
-// Arrow-key picker in the style of Claude Code. Resolves to a name, ADD, or null (quit).
-const ADD = Symbol('add');
-function pickAccount(names, accs) {
+// ---------- interactive screens ----------
+
+// Redraws render() in place and feeds keys to onKey(str, key, state) until it calls state.done(value).
+// state.sel is the highlighted row; arrows, j/k, home/end and 1-9 move it.
+function interactive(count, render, onKey) {
   return new Promise(resolve => {
     const out = process.stdout;
-    const nameW = Math.max(...names.map(n => n.length));
-    const maxHint = Math.max(20, (out.columns || 80) - nameW - 12);
-    let sel = 0;
+    const state = { sel: 0 };
     let drawn = 0;
 
-    const render = () => {
-      const rows = names.map((n, k) => {
-        let hint = n === OWN ? 'your own login (no token)' : 'token' + (accs[n].note ? ' · ' + accs[n].note : '');
-        if (hint.length > maxHint) hint = hint.slice(0, maxHint - 1) + '…';
-        const label = `${k + 1}. ${n.padEnd(nameW)}`;
-        return k === sel
-          ? brand('❯ ') + bold(brand(label)) + '  ' + dim(hint)
-          : '  ' + label + '  ' + dim(hint);
-      });
-      return [bold('Which account?'), '', ...rows, '', dim('↑/↓ move · enter start · a add account · esc quit')];
-    };
     const draw = () => {
-      if (drawn) out.write(`\x1b[${drawn}A\x1b[J`); // back to the top of the menu, clear below
-      const lines = render();
+      if (drawn) out.write(`\x1b[${drawn}A\x1b[J`); // back to the top of the screen, clear below
+      const lines = render(state);
       out.write(lines.join('\n') + '\n');
       drawn = lines.length;
     };
-    const finish = value => {
-      process.stdin.removeListener('keypress', onKey);
+    state.redraw = draw;
+    state.done = value => {
+      process.stdin.removeListener('keypress', handler);
       process.stdin.setRawMode(false);
       process.stdin.pause();
       out.write('\x1b[?25h'); // show cursor
       resolve(value);
     };
-    const onKey = (str, key = {}) => {
-      if (key.ctrl && key.name === 'c') return finish(null);
+    const handler = (str, key = {}) => {
+      if (key.ctrl && key.name === 'c') return state.done(null);
       switch (key.name) {
-        case 'up': case 'k': sel = (sel - 1 + names.length) % names.length; return draw();
-        case 'down': case 'j': sel = (sel + 1) % names.length; return draw();
-        case 'home': sel = 0; return draw();
-        case 'end': sel = names.length - 1; return draw();
-        case 'return': case 'enter': return finish(names[sel]);
-        case 'escape': case 'q': return finish(null);
-        case 'a': return finish(ADD);
+        case 'up': case 'k': state.sel = (state.sel - 1 + count) % count; return draw();
+        case 'down': case 'j': state.sel = (state.sel + 1) % count; return draw();
+        case 'home': state.sel = 0; return draw();
+        case 'end': state.sel = count - 1; return draw();
+        case 'escape': case 'q': return state.done(null);
       }
-      if (/^[1-9]$/.test(str || '') && +str <= names.length) { sel = +str - 1; return draw(); }
+      if (/^[1-9]$/.test(str || '') && +str <= count) { state.sel = +str - 1; return draw(); }
+      onKey(str, key, state);
     };
 
     readline.emitKeypressEvents(process.stdin);
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.on('exit', () => out.write('\x1b[?25h'));
-    out.write('\x1b[?25l'); // hide cursor while picking
-    process.stdin.on('keypress', onKey);
+    out.write('\x1b[?25l'); // hide cursor while the screen is up
+    process.stdin.on('keypress', handler);
     draw();
   });
 }
 
+function accountHint(db, n, max) {
+  let hint = n === OWN ? 'your own login (no token)' : 'token' + (db.accounts[n].note ? ' · ' + db.accounts[n].note : '');
+  return hint.length > max ? hint.slice(0, max - 1) + '…' : hint;
+}
+
+// Arrow-key picker in the style of Claude Code. Resolves to a name, ADD, or null (quit).
+const ADD = Symbol('add');
+function pickAccount(names, db) {
+  const nameW = Math.max(...names.map(n => n.length));
+  const maxHint = Math.max(20, (process.stdout.columns || 80) - nameW - 12);
+  const render = ({ sel }) => [
+    bold('Which account?'), '',
+    ...names.map((n, k) => {
+      const label = `${k + 1}. ${n.padEnd(nameW)}`;
+      const hint = dim(accountHint(db, n, maxHint));
+      const tag = getBypass(db, n) ? '  ' + yellow('⚠ bypass') : '';
+      return (k === sel ? brand('❯ ') + bold(brand(label)) : '  ' + label) + '  ' + hint + tag;
+    }),
+    '', dim('↑/↓ move · enter start · b bypass permissions on/off · a add account · esc quit'),
+  ];
+  return interactive(names.length, render, (str, key, s) => {
+    if (key.name === 'return' || key.name === 'enter') return s.done(names[s.sel]);
+    if (key.name === 'a') return s.done(ADD);
+    if (key.name === 'b') {
+      setBypass(db, names[s.sel], !getBypass(db, names[s.sel]));
+      save(db);
+      s.redraw();
+    }
+  });
+}
+
+// Checkbox list of every account. Resolves to the set of checked names, or null if cancelled.
+function checkBypass(names, db) {
+  const checked = new Set(names.filter(n => getBypass(db, n)));
+  const nameW = Math.max(...names.map(n => n.length));
+  const maxHint = Math.max(20, (process.stdout.columns || 80) - nameW - 14);
+  const render = ({ sel }) => [
+    bold('Bypass permissions'),
+    dim(`Checked accounts start claude with ${BYPASS_FLAG}.`), '',
+    ...names.map((n, k) => {
+      const box = checked.has(n) ? yellow('[✔]') : dim('[ ]');
+      const label = n.padEnd(nameW);
+      const hint = dim(accountHint(db, n, maxHint));
+      return (k === sel ? brand('❯ ') + box + ' ' + bold(brand(label)) : '  ' + box + ' ' + label) + '  ' + hint;
+    }),
+    '', dim('↑/↓ move · space check/uncheck · enter save · esc cancel'),
+  ];
+  return interactive(names.length, render, (str, key, s) => {
+    if (key.name === 'space') {
+      const n = names[s.sel];
+      if (checked.has(n)) checked.delete(n); else checked.add(n);
+      return s.redraw();
+    }
+    if (key.name === 'return' || key.name === 'enter') return s.done(checked);
+  });
+}
+
 async function cmdMenu() {
-  const accs = load().accounts;
+  const db = load();
+  const accs = db.accounts;
   const names = [OWN, ...Object.keys(accs)];
 
   if (process.stdin.isTTY && process.stdout.isTTY) {
     banner();
     console.log();
-    const choice = await pickAccount(names, accs);
+    const choice = await pickAccount(names, db);
     if (choice === null) return;
     if (choice === ADD) return cmdAdd();
     return launch(choice, []);
@@ -345,6 +434,8 @@ function help() {
   clauder ${OWN} [claude args]       start claude with your own login
   clauder add [name]             add a token (hidden input)
   clauder list                   list accounts and their login status
+  clauder bypass                 check which accounts start with ${BYPASS_FLAG}
+  clauder bypass <name> [on|off] same for one account (flips it without on/off)
   clauder remove <name>          remove an account
   clauder rename <old> <new>     rename an account
   clauder path                   print the accounts.json path
@@ -361,6 +452,7 @@ Accounts file: ${DB_FILE}`);
     case undefined: return cmdMenu();
     case 'add': return cmdAdd(rest[0]);
     case 'list': case 'ls': return cmdList();
+    case 'bypass': return cmdBypass(rest[0], rest[1]);
     case 'remove': case 'rm': return cmdRemove(rest[0]);
     case 'rename': case 'mv': return cmdRename(rest[0], rest[1]);
     case 'path': return console.log(DB_FILE);

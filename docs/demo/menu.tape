@@ -2,7 +2,7 @@ Output docs/menu.gif
 
 Set Shell bash
 Set FontSize 15
-Set Width 900
+Set Width 1000
 Set Height 520
 Set Padding 24
 Set Theme "Catppuccin Mocha"
@@ -24,5 +24,7 @@ Down
 Sleep 700ms
 Up
 Sleep 900ms
+Type "b"
+Sleep 1.2s
 Enter
 Sleep 2.5s

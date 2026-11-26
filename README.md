@@ -34,6 +34,7 @@ Run `clauder` with no arguments to get a menu. Move with the arrow keys and pres
 | ↑ ↓ or j k | move (wraps around) |
 | 1 to 9 | jump to that row |
 | Enter | start `claude` with the selected account |
+| b | turn bypass permissions on or off for the selected account |
 | a | add an account |
 | Esc, q or Ctrl+C | quit |
 
@@ -59,6 +60,32 @@ The token is masked while you type. The note is optional and shows up in the men
 `clauder` never checks a token itself. If one has expired or been revoked, `claude` shows the
 login error when it starts; get a fresh token and run `clauder add <name>` again.
 
+## Bypass permissions
+
+Each account has its own bypass switch, off by default. While it is on, `clauder` starts
+`claude` with `--dangerously-skip-permissions`, so Claude runs tools and edits files without
+asking first. The menu marks those accounts with a yellow `⚠ bypass` tag, and the launch line
+repeats the warning.
+
+Run `clauder bypass` to set them all at once. Space checks or unchecks the highlighted account,
+Enter saves, and Esc leaves everything as it was.
+
+![Choosing bypass accounts](docs/bypass.gif)
+
+For a single account, or in a script, name it:
+
+```sh
+clauder bypass alice on
+clauder bypass alice off
+clauder bypass alice       # flip it
+clauder bypass me on       # works for your own login too
+```
+
+Pressing `b` in the main menu flips the highlighted account too. Arguments you pass yourself take priority: if you give
+`--permission-mode` (for example `clauder alice --permission-mode plan`), `clauder` leaves the
+flag off for that run. An organization policy can disable bypass mode, and then `claude`
+refuses to start with it.
+
 ## All commands
 
 ```sh
@@ -67,6 +94,8 @@ clauder <name> [args]      # start claude as <name>, passing [args] to claude
 clauder me [args]          # start claude with your own login
 clauder add [name]         # add or replace a token
 clauder list               # accounts with their login status
+clauder bypass             # checkbox list of all accounts
+clauder bypass <name> [on|off]
 clauder rename <old> <new>
 clauder remove <name>
 clauder path               # where accounts.json lives
@@ -86,8 +115,9 @@ The file is plain JSON, so you can edit it by hand:
 ```json
 {
   "accounts": {
-    "alice": { "token": "sk-ant-oat01-...", "addedAt": "2026-11-26T10:00:00.000Z", "note": "work" }
-  }
+    "alice": { "token": "sk-ant-oat01-...", "addedAt": "2026-11-26T10:00:00.000Z", "note": "work", "bypass": true }
+  },
+  "me": { "bypass": true }
 }
 ```
 

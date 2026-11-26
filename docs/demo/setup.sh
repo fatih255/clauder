@@ -21,9 +21,9 @@ if [ "$1" = auth ] && [ "$2" = status ]; then
 fi
 echo
 if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-  echo "  (demo) claude started with token ...${CLAUDE_CODE_OAUTH_TOKEN##*-}"
+  echo "  (demo) claude started with token ...${CLAUDE_CODE_OAUTH_TOKEN##*-} $*"
 else
-  echo "  (demo) claude started with your own login"
+  echo "  (demo) claude started with your own login $*"
 fi
 echo
 EOF
