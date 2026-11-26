@@ -8,12 +8,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const HOME_DIR = process.env.CLAUDER_HOME || path.join(os.homedir(), '.clauder');
 const DB_FILE = path.join(HOME_DIR, 'accounts.json');
 const OWN = 'me'; // no token: your normal `claude` login
-const TOKEN_LIFETIME_DAYS = 365; // `claude setup-token` tokens last about a year
 
 // ---------- storage ----------
 
@@ -47,17 +46,62 @@ function validName(name) {
   return /^[a-zA-Z0-9._-]{1,40}$/.test(name || '') && name !== OWN;
 }
 
-function daysSince(iso) {
-  return Math.floor((Date.now() - Date.parse(iso)) / 86400000);
+// ---------- look ----------
+
+// Colors on a real terminal (or with FORCE_COLOR), never when NO_COLOR is set.
+const COLOR = (process.stdout.isTTY || !!process.env.FORCE_COLOR) && !process.env.NO_COLOR;
+const paint = code => s => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : s);
+const brand = paint('38;2;217;119;87'); // Claude orange #D97757
+const green = paint('32');
+const red = paint('31');
+const yellow = paint('33');
+const bold = paint('1');
+const dim = paint('2');
+
+const shade = paint('38;2;140;74;51'); // darker orange for the letter shadows
+
+// "CLAUDER" in block letters with box-drawing shadows. Every row of a letter has the same width.
+const LOGO = [
+  [' ██████╗', '██╔════╝', '██║     ', '██║     ', '╚██████╗', ' ╚═════╝'], // C
+  ['██╗     ', '██║     ', '██║     ', '██║     ', '███████╗', '╚══════╝'], // L
+  [' █████╗ ', '██╔══██╗', '███████║', '██╔══██║', '██║  ██║', '╚═╝  ╚═╝'], // A
+  ['██╗   ██╗', '██║   ██║', '██║   ██║', '██║   ██║', '╚██████╔╝', ' ╚═════╝ '], // U
+  ['██████╗ ', '██╔══██╗', '██║  ██║', '██║  ██║', '██████╔╝', '╚═════╝ '], // D
+  ['███████╗', '██╔════╝', '█████╗  ', '██╔══╝  ', '███████╗', '╚══════╝'], // E
+  ['██████╗ ', '██╔══██╗', '██████╔╝', '██╔══██╗', '██║  ██║', '╚═╝  ╚═╝'], // R
+];
+
+function banner() {
+  const { version } = require('../package.json');
+  const sub = `v${version}  •  start Claude Code as different accounts`;
+  const rows = LOGO[0].map((_, r) => LOGO.map(letter => letter[r]).join(''));
+  console.log();
+  if ((process.stdout.columns || 80) < rows[0].length + 2) {
+    // narrow terminal: one-line fallback
+    console.log('  ' + brand('✻ ') + bold(brand('clauder')));
+  } else {
+    for (const row of rows) {
+      console.log('  ' + row.replace(/█+/g, m => brand(m)).replace(/[╗║╚═╔╝]+/g, m => shade(m)));
+    }
+  }
+  console.log('\n  ' + dim(sub) + '\n');
 }
 
-function ageText(acc) {
-  if (!acc || !acc.addedAt) return '';
-  const left = TOKEN_LIFETIME_DAYS - daysSince(acc.addedAt);
-  if (left <= 0) return '(may have expired)';
-  if (left <= 30) return `(~${left} days left, consider renewing)`;
-  return `(~${left} days left)`;
+// A cell is a plain string, or { t: plain text, s: styled text } when colored.
+function table(head, rows) {
+  const txt = x => (typeof x === 'string' ? x : x.t);
+  const fmt = x => (typeof x === 'string' ? x : x.s);
+  const w = head.map((h, i) => Math.max(h.length, ...rows.map(r => txt(r[i]).length)));
+  const rule = (l, m, r) => brand(l + w.map(n => '─'.repeat(n + 2)).join(m) + r);
+  const bar = brand('│');
+  const row = cells => bar + cells.map((x, i) => ' ' + fmt(x) + ' '.repeat(w[i] - txt(x).length + 1)).join(bar) + bar;
+  console.log(rule('╭', '┬', '╮'));
+  console.log(row(head.map(h => ({ t: h, s: bold(h) }))));
+  console.log(rule('├', '┼', '┤'));
+  rows.forEach(r => console.log(row(r)));
+  console.log(rule('╰', '┴', '╯'));
 }
+
 
 function ask(question) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -128,6 +172,18 @@ function launch(name, claudeArgs) {
   child.on('exit', code => process.exit(code ?? 0));
 }
 
+// Ask `claude auth status --json` how an account looks. Returns null if claude is missing.
+function authStatus(token) {
+  const env = { ...process.env };
+  delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token;
+  const r = spawnSync('claude', ['auth', 'status', '--json'], {
+    env, encoding: 'utf8', shell: process.platform === 'win32' && !hasExe(),
+  });
+  if (r.error) return null;
+  try { return JSON.parse(r.stdout.slice(r.stdout.indexOf('{'))); } catch { return {}; }
+}
+
 // ---------- commands ----------
 
 async function cmdAdd(name) {
@@ -149,13 +205,26 @@ async function cmdAdd(name) {
 
 function cmdList() {
   const accs = load().accounts;
-  const names = Object.keys(accs);
-  console.log(`  ${OWN.padEnd(14)} your own login (no token)`);
-  for (const n of names) {
-    const a = accs[n];
-    console.log(`  ${n.padEnd(14)} ${ageText(a)}${a.note ? '  - ' + a.note : ''}`);
-  }
-  if (!names.length) console.log('\n  no accounts yet. Add one with: clauder add <name>');
+  const names = [OWN, ...Object.keys(accs)];
+  const rows = names.map(name => {
+    const own = name === OWN;
+    const s = authStatus(own ? null : accs[name].token);
+    const state = s === null ? { t: '? claude not found', s: yellow('? claude not found') }
+      : s.loggedIn ? { t: '✔', s: green('✔') }
+      : { t: '✘ not logged in', s: red('✘ not logged in') };
+    const details = own
+      ? [s && s.email, s && s.orgName, s && s.subscriptionType]
+      : [accs[name].note];
+    return [
+      { t: name, s: bold(name) },
+      own ? 'your own login (no token)' : 'token',
+      state,
+      details.filter(Boolean).join('  '),
+    ];
+  });
+  banner();
+  table(['Account', 'Type', 'Status', 'Details'], rows);
+  if (names.length === 1) console.log(dim('\n  no token accounts yet. Add one with: clauder add <name>'));
 }
 
 async function cmdRemove(name) {
@@ -179,15 +248,87 @@ function cmdRename(from, to) {
   console.log(`${from} -> ${to}`);
 }
 
+// Arrow-key picker in the style of Claude Code. Resolves to a name, ADD, or null (quit).
+const ADD = Symbol('add');
+function pickAccount(names, accs) {
+  return new Promise(resolve => {
+    const out = process.stdout;
+    const nameW = Math.max(...names.map(n => n.length));
+    const maxHint = Math.max(20, (out.columns || 80) - nameW - 12);
+    let sel = 0;
+    let drawn = 0;
+
+    const render = () => {
+      const rows = names.map((n, k) => {
+        let hint = n === OWN ? 'your own login (no token)' : 'token' + (accs[n].note ? ' · ' + accs[n].note : '');
+        if (hint.length > maxHint) hint = hint.slice(0, maxHint - 1) + '…';
+        const label = `${k + 1}. ${n.padEnd(nameW)}`;
+        return k === sel
+          ? brand('❯ ') + bold(brand(label)) + '  ' + dim(hint)
+          : '  ' + label + '  ' + dim(hint);
+      });
+      return [bold('Which account?'), '', ...rows, '', dim('↑/↓ move · enter start · a add account · esc quit')];
+    };
+    const draw = () => {
+      if (drawn) out.write(`\x1b[${drawn}A\x1b[J`); // back to the top of the menu, clear below
+      const lines = render();
+      out.write(lines.join('\n') + '\n');
+      drawn = lines.length;
+    };
+    const finish = value => {
+      process.stdin.removeListener('keypress', onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write('\x1b[?25h'); // show cursor
+      resolve(value);
+    };
+    const onKey = (str, key = {}) => {
+      if (key.ctrl && key.name === 'c') return finish(null);
+      switch (key.name) {
+        case 'up': case 'k': sel = (sel - 1 + names.length) % names.length; return draw();
+        case 'down': case 'j': sel = (sel + 1) % names.length; return draw();
+        case 'home': sel = 0; return draw();
+        case 'end': sel = names.length - 1; return draw();
+        case 'return': case 'enter': return finish(names[sel]);
+        case 'escape': case 'q': return finish(null);
+        case 'a': return finish(ADD);
+      }
+      if (/^[1-9]$/.test(str || '') && +str <= names.length) { sel = +str - 1; return draw(); }
+    };
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.on('exit', () => out.write('\x1b[?25h'));
+    out.write('\x1b[?25l'); // hide cursor while picking
+    process.stdin.on('keypress', onKey);
+    draw();
+  });
+}
+
 async function cmdMenu() {
   const accs = load().accounts;
   const names = [OWN, ...Object.keys(accs)];
-  console.log('Which account?\n');
-  names.forEach((n, i) => {
-    console.log(`  ${i + 1}) ${n} ${n === OWN ? '(your own login)' : ageText(accs[n])}`);
-  });
-  console.log('  a) add an account');
-  console.log('  q) quit\n');
+
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    banner();
+    console.log();
+    const choice = await pickAccount(names, accs);
+    if (choice === null) return;
+    if (choice === ADD) return cmdAdd();
+    return launch(choice, []);
+  }
+
+  // Not a terminal (piped input): numbered prompt.
+  const hasNotes = names.some(n => n !== OWN && accs[n].note);
+  banner();
+  table(['#', 'Account', 'Type', ...(hasNotes ? ['Note'] : [])], names.map((n, i) => [
+    { t: String(i + 1), s: brand(String(i + 1)) },
+    { t: n, s: bold(n) },
+    n === OWN ? 'your own login (no token)' : 'token',
+    ...(hasNotes ? [n === OWN ? '' : accs[n].note || ''] : []),
+  ]));
+  console.log(`  ${brand('a')}) add an account   ${brand('q')}) quit\n`);
   const pick = (await ask('Choice: ')).toLowerCase();
   if (pick === 'q' || pick === '') return;
   if (pick === 'a') return cmdAdd();
@@ -203,10 +344,9 @@ function help() {
   clauder <name> [claude args]   start claude with that account   (e.g. clauder alice -c)
   clauder ${OWN} [claude args]       start claude with your own login
   clauder add [name]             add a token (hidden input)
-  clauder list                   list accounts
+  clauder list                   list accounts and their login status
   clauder remove <name>          remove an account
   clauder rename <old> <new>     rename an account
-  clauder status [name]          show that account's auth status
   clauder path                   print the accounts.json path
 
 To get a token, the account owner runs on their machine: claude setup-token
@@ -223,7 +363,6 @@ Accounts file: ${DB_FILE}`);
     case 'list': case 'ls': return cmdList();
     case 'remove': case 'rm': return cmdRemove(rest[0]);
     case 'rename': case 'mv': return cmdRename(rest[0], rest[1]);
-    case 'status': return launch(rest[0] || OWN, ['auth', 'status']);
     case 'path': return console.log(DB_FILE);
     case 'help': case '-h': case '--help': return help();
     default:
