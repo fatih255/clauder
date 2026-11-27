@@ -322,6 +322,7 @@ function listConversations(all, active) {
   return out;
 }
 
+const SHOWN = 5; // conversations on screen at once in the picker
 const NEW = Symbol('new');
 const BACK = Symbol('back');
 
@@ -366,7 +367,8 @@ function pickSession(name, { canGoBack }) {
       const foot = ['', ...help.map(l => dim(l))];
       // each conversation takes 3 rows (title, details, gap); keep the selection on screen
       // (-2: one row for the "↓ more" line, one for the cursor's line after the last newline)
-      const fit = Math.max(1, Math.floor((rows - head.length - foot.length - 2) / 3));
+      // At most SHOWN at a time, like claude's own resume screen; fewer on a short terminal.
+      const fit = Math.max(1, Math.min(SHOWN, Math.floor((rows - head.length - foot.length - 2) / 3)));
       if (st.sel < st.top) st.top = st.sel;
       if (st.sel >= st.top + fit) st.top = st.sel - fit + 1;
       st.top = Math.max(0, Math.min(st.top, Math.max(0, items.length - fit)));
@@ -436,9 +438,7 @@ function pickSession(name, { canGoBack }) {
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.on('exit', () => out.write('\x1b[?25h'));
-    // Start on a clean screen: the list is sized to the terminal's height, and drawn below the
-    // banner it would run off the bottom, scroll, and break the redraw.
-    out.write('\x1b[2J\x1b[H\x1b[?25l');
+    out.write('\x1b[?25l');
     process.stdin.on('keypress', onKey);
     draw();
   });

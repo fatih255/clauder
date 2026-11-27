@@ -54,8 +54,8 @@ the same conversation, with all of its history, as another account. From then on
 counts against that account.
 
 After you pick an account in the menu, `clauder` lists your conversations from every project,
-newest first, in the style of Claude Code's own resume screen. `clauder alice -r` opens the
-same list.
+newest first, in the style of Claude Code's own resume screen. It shows five at a time; move
+down or search to see the rest. `clauder alice -r` opens the same list.
 
 Here alice left a conversation running in the background. Picking it as bob stops alice's
 copy, opens the conversation with its history, and bob carries on:
