@@ -167,7 +167,376 @@ function setBypass(db, name, on) {
   else delete entry.bypass;
 }
 
-function launch(name, claudeArgs) {
+// ---------- sessions running in the background ----------
+
+// A session that runs in the background keeps the account it was started with, and claude
+// refuses to resume it from another process. Before resuming we look for that and offer to stop it.
+
+function claudeSync(args) {
+  const env = { ...process.env };
+  delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  return spawnSync('claude', args, {
+    env, encoding: 'utf8', shell: process.platform === 'win32' && !hasExe(),
+  });
+}
+
+const DONE_STATES = ['stopped', 'completed', 'done', 'failed', 'killed', 'exited'];
+
+// Background sessions that are still alive, from `claude agents --json`. [] if that fails.
+const backgroundSessions = () => activeSessions().filter(s => s.kind === 'background');
+
+const samePath = (a, b) => {
+  const norm = p => path.resolve(p || '').replace(/[\\/]+$/, '');
+  return process.platform === 'win32' || process.platform === 'darwin'
+    ? norm(a).toLowerCase() === norm(b).toLowerCase()
+    : norm(a) === norm(b);
+};
+
+// Where claude keeps this folder's conversations: ~/.claude/projects/<cwd with non-alphanumerics as ->
+const projectDir = cwd => path.join(os.homedir(), '.claude', 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
+
+// This folder's conversation files, newest first: [{ id, file, mtime }]
+function sessionFiles(cwd) {
+  const dir = projectDir(cwd);
+  try {
+    return fs.readdirSync(dir).filter(f => f.endsWith('.jsonl'))
+      .map(f => ({ id: f.slice(0, -'.jsonl'.length), file: path.join(dir, f), mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+  } catch { return []; }
+}
+
+// Newest conversation in this folder, which is what `claude -c` continues.
+function lastSessionId(cwd) {
+  const files = sessionFiles(cwd);
+  return files.length ? files[0].id : null;
+}
+
+// Read up to `size` bytes from the start (or the end) of a file.
+function readPart(file, size, fromEnd) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const len = fs.fstatSync(fd).size;
+    const n = Math.min(size, len);
+    const buf = Buffer.alloc(n);
+    fs.readSync(fd, buf, 0, n, fromEnd ? len - n : 0);
+    return buf.toString('utf8');
+  } finally { fs.closeSync(fd); }
+}
+
+const parseLines = text => text.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+// What the picker shows for a conversation: its title, the folder and git branch it ran in.
+// Title is the name it was given, else claude's own title, else its first message.
+// Returns null for files with no message typed by a person (nothing to resume).
+function sessionMeta(file) {
+  try {
+    const tail = parseLines(readPart(file, 64 * 1024, true));
+    let custom = null, ai = null;
+    for (const o of tail) {
+      if (o.type === 'custom-title' && o.customTitle) custom = o.customTitle;
+      if (o.type === 'ai-title' && o.aiTitle) ai = o.aiTitle;
+    }
+    const head = parseLines(readPart(file, 64 * 1024, false));
+    const first = head.find(o => o.type === 'user' && !o.isSidechain && !o.isMeta && textOf(o));
+    if (!first && !custom && !ai) return null;
+    const withCwd = [...tail].reverse().find(o => o.cwd) || head.find(o => o.cwd) || {};
+    return {
+      title: (custom || ai || textOf(first)).replace(/\s+/g, ' ').trim(),
+      cwd: withCwd.cwd || null,
+      branch: withCwd.gitBranch || null,
+    };
+  } catch { return null; }
+}
+
+function textOf(entry) {
+  const c = entry && entry.message && entry.message.content;
+  const text = typeof c === 'string' ? c
+    : Array.isArray(c) ? c.filter(p => p.type === 'text').map(p => p.text).join(' ') : '';
+  return text && !text.startsWith('<') ? text : ''; // skip <command-name> and other tool-made entries
+}
+
+function ago(ms) {
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  const n = (v, unit) => `${v} ${unit}${v === 1 ? '' : 's'} ago`;
+  if (s < 60) return 'just now';
+  if (s < 3600) return n(Math.floor(s / 60), 'minute');
+  if (s < 86400) return n(Math.floor(s / 3600), 'hour');
+  return n(Math.floor(s / 86400), 'day');
+}
+
+function fileSize(bytes) {
+  if (bytes < 1024) return bytes + 'B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1).replace(/\.0$/, '') + 'KB';
+  return (bytes / 1024 / 1024).toFixed(1).replace(/\.0$/, '') + 'MB';
+}
+
+// Active sessions of every kind from `claude agents --json`, so the list can mark them.
+function activeSessions() {
+  const r = claudeSync(['agents', '--json']);
+  if (r.error || r.status !== 0) return [];
+  try {
+    return JSON.parse(r.stdout.slice(r.stdout.indexOf('['))).filter(s => s.sessionId && !DONE_STATES.includes(s.state));
+  } catch { return []; }
+}
+
+// Conversation files of this folder, or of every folder, newest first.
+function conversationFiles(all) {
+  if (!all) return sessionFiles(process.cwd());
+  const root = path.join(os.homedir(), '.claude', 'projects');
+  let dirs = [];
+  try { dirs = fs.readdirSync(root); } catch { return []; }
+  const files = [];
+  for (const d of dirs) {
+    let names = [];
+    try { names = fs.readdirSync(path.join(root, d)); } catch { continue; }
+    for (const f of names) {
+      if (!f.endsWith('.jsonl')) continue;
+      const file = path.join(root, d, f);
+      try { files.push({ id: f.slice(0, -'.jsonl'.length), file, mtime: fs.statSync(file).mtimeMs }); } catch {}
+    }
+  }
+  return files.sort((a, b) => b.mtime - a.mtime);
+}
+
+const MAX_LISTED = 200;
+
+// Conversations for the picker: [{ id, file, mtime, size, title, cwd, branch, bg, open }]
+function listConversations(all, active) {
+  const out = [];
+  for (const f of conversationFiles(all)) {
+    if (out.length >= MAX_LISTED) break;
+    const meta = sessionMeta(f.file);
+    if (!meta) continue;
+    let size = 0;
+    try { size = fs.statSync(f.file).size; } catch {}
+    const a = active.find(s => s.sessionId === f.id);
+    out.push({
+      ...f, ...meta, size,
+      cwd: meta.cwd || process.cwd(),
+      bg: a && a.kind === 'background' ? a : null,
+      open: a && a.kind !== 'background' ? a : null,
+    });
+  }
+  return out;
+}
+
+const NEW = Symbol('new');
+const BACK = Symbol('back');
+
+// Two-line list in the style of claude's own resume screen, with a search box.
+// Shows the conversations of every project, newest first.
+// Resolves to NEW, BACK (esc) or a conversation from listConversations().
+function pickSession(name, { canGoBack }) {
+  return new Promise(resolve => {
+    const out = process.stdout;
+    const list = listConversations(true, activeSessions());
+    const st = { query: '', sel: 0, top: 0 };
+    let drawn = 0;
+
+    const matches = () => {
+      const q = st.query.toLowerCase();
+      const hit = c => [c.title, c.branch, path.basename(c.cwd)].some(x => x && x.toLowerCase().includes(q));
+      return q ? list.filter(hit) : [NEW, ...list];
+    };
+
+    const render = () => {
+      const cols = out.columns || 80;
+      const rows = out.rows || 24;
+      const items = matches();
+      st.sel = Math.min(st.sel, Math.max(0, items.length - 1));
+      const boxW = Math.max(20, Math.min(cols - 2, 100));
+      const search = fitWidth('⌕ ' + (st.query ? st.query + brand('▏') : dim('Search…')), boxW - 4);
+      const head = [
+        bold(brand(`Start claude as ${name}`)),
+        dim('╭' + '─'.repeat(boxW - 2) + '╮'),
+        dim('│ ') + search + ' '.repeat(Math.max(0, boxW - 4 - visWidth(search))) + dim(' │'),
+        dim('╰' + '─'.repeat(boxW - 2) + '╯'),
+        '  ' + dim('all projects · new conversations start in ' + path.basename(process.cwd())),
+        '',
+      ];
+      const keys = ['Type to search', 'Enter to start', `Esc to ${st.query ? 'clear' : canGoBack ? 'go back' : 'close'}`];
+      const help = [''];
+      for (const k of keys) { // wrap the key help instead of cutting it
+        const last = help.length - 1;
+        if (help[last] && visWidth(help[last] + ' · ' + k) > cols - 1) help.push(k);
+        else help[last] = help[last] ? help[last] + ' · ' + k : k;
+      }
+      const foot = ['', ...help.map(l => dim(l))];
+      // each conversation takes 3 rows (title, details, gap); keep the selection on screen
+      const fit = Math.max(1, Math.floor((rows - head.length - foot.length - 1) / 3));
+      if (st.sel < st.top) st.top = st.sel;
+      if (st.sel >= st.top + fit) st.top = st.sel - fit + 1;
+      st.top = Math.max(0, Math.min(st.top, Math.max(0, items.length - fit)));
+
+      const body = [];
+      if (!items.length) body.push('  ' + dim(st.query ? 'No conversations match.' : 'No conversations here yet.'));
+      items.slice(st.top, st.top + fit).forEach((c, k) => {
+        const on = st.top + k === st.sel;
+        const mark = on ? brand('❯ ') : '  ';
+        if (c === NEW) {
+          body.push(mark + (on ? bold(brand('New conversation')) : 'New conversation'));
+          body.push('  ' + dim('start fresh'));
+        } else {
+          body.push(mark + (on ? bold(brand(c.title)) : c.title));
+          const bits = [ago(c.mtime)];
+          if (c.bg) bits.push(yellow('bg · running, will be stopped'));
+          else if (c.open) bits.push(red('open in another terminal'));
+          bits.push(samePath(c.cwd, process.cwd()) ? path.basename(c.cwd) : brand(path.basename(c.cwd)));
+          if (c.branch) bits.push(c.branch);
+          bits.push(fileSize(c.size));
+          body.push('  ' + bits.map(b => dim(b)).join(dim(' · ')));
+        }
+        body.push('');
+      });
+      const more = items.length - (st.top + fit);
+      if (more > 0) body.push('  ' + dim(`↓ ${more} more`));
+      return [...head, ...body, ...foot];
+    };
+
+    const draw = () => {
+      if (drawn) out.write(`\x1b[${drawn}A\x1b[J`);
+      const lines = render().map(l => fitWidth(l, (out.columns || 80) - 1));
+      out.write(lines.join('\n') + '\n');
+      drawn = lines.length;
+    };
+
+    const done = value => {
+      if (drawn) out.write(`\x1b[${drawn}A\x1b[J`);
+      process.stdin.removeListener('keypress', onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      out.write('\x1b[?25h');
+      resolve(value);
+    };
+
+    const onKey = (str, key = {}) => {
+      const items = matches();
+      if (key.ctrl && key.name === 'c') return done(BACK);
+      switch (key.name) {
+        case 'up': st.sel = (st.sel - 1 + items.length) % Math.max(1, items.length); return draw();
+        case 'down': st.sel = (st.sel + 1) % Math.max(1, items.length); return draw();
+        case 'pageup': st.sel = Math.max(0, st.sel - 5); return draw();
+        case 'pagedown': st.sel = Math.min(items.length - 1, st.sel + 5); return draw();
+        case 'home': st.sel = 0; return draw();
+        case 'end': st.sel = Math.max(0, items.length - 1); return draw();
+        case 'return': case 'enter': return items.length ? done(items[st.sel]) : undefined;
+        case 'escape':
+          if (st.query) { st.query = ''; st.sel = 0; return draw(); }
+          return done(BACK);
+        case 'backspace':
+          st.query = st.query.slice(0, -1); st.sel = 0; return draw();
+      }
+      if (str && !key.ctrl && !key.meta && str >= ' ') { st.query += str; st.sel = 0; return draw(); }
+    };
+
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.on('exit', () => out.write('\x1b[?25h'));
+    out.write('\x1b[?25l');
+    process.stdin.on('keypress', onKey);
+    draw();
+  });
+}
+
+// Ask which conversation to start. Returns { args, cwd } for launch(), or BACK if esc was pressed.
+async function chooseConversation(name, args, { canGoBack }) {
+  const pick = await pickSession(name, { canGoBack });
+  if (pick === BACK) return BACK;
+  if (pick === NEW) return { args };
+  if (pick.open) die(`"${pick.title}" is open in another terminal. Close it there first, then try again.`);
+  if (!fs.existsSync(pick.cwd)) die(`the folder of "${pick.title}" no longer exists: ${pick.cwd}`);
+  if (pick.bg) stopSession(pick.bg);
+  return { args: ['--resume', pick.id, ...args], cwd: pick.cwd };
+}
+
+// What the claude args ask to resume: { kind: 'id', value } | { kind: 'pick' } | { kind: 'last' } | null
+function resumeTarget(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('--resume=')) return { kind: 'id', value: a.slice(9), index: i };
+    if (a === '-r' || a === '--resume') {
+      const next = args[i + 1];
+      return next && !next.startsWith('-') ? { kind: 'id', value: next, index: i } : { kind: 'pick', index: i };
+    }
+    if (a === '-c' || a === '--continue') return { kind: 'last', index: i };
+  }
+  return null;
+}
+
+function matchSession(sessions, value) {
+  const v = value.toLowerCase();
+  return sessions.find(s => s.sessionId === value || s.id === value
+    || (v.length >= 8 && s.sessionId.startsWith(v)) || (s.name && s.name.toLowerCase() === v));
+}
+
+function stopSession(s) {
+  process.stderr.write(dim(`stopping ${s.id} …`));
+  const r = claudeSync(['stop', s.id]);
+  // wait until it is gone from the list, at most ~10 s
+  for (let i = 0; i < 20 && backgroundSessions().some(x => x.sessionId === s.sessionId); i++) {
+    spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},500)']);
+  }
+  process.stderr.write('\r\x1b[K');
+  if (r.status !== 0) die(`could not stop ${s.id}: ${(r.stderr || r.stdout || '').trim()}`);
+  console.error(green('✔ ') + `stopped "${s.name || s.id}"`);
+}
+
+const label = s => `"${s.name || s.id}"` + dim(` (${s.id})`);
+
+// Yes/no on one key: Enter or y = yes, Esc, n or Ctrl+C = no.
+function confirmKey(question) {
+  return new Promise(resolve => {
+    process.stderr.write(question + dim('  enter yes · esc cancel '));
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    const onKey = (str, key = {}) => {
+      const yes = key.name === 'return' || key.name === 'enter' || key.name === 'y';
+      const no = key.name === 'escape' || key.name === 'n' || (key.ctrl && key.name === 'c');
+      if (!yes && !no) return;
+      process.stdin.removeListener('keypress', onKey);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stderr.write('\n');
+      resolve(yes);
+    };
+    process.stdin.on('keypress', onKey);
+  });
+}
+
+// Returns { args, cwd } for launch(), after stopping a background session if the user agrees.
+async function freeSession(name, args) {
+  const target = resumeTarget(args);
+  if (!target) return { args };
+  const tty = process.stdin.isTTY && process.stdout.isTTY;
+  const cwd = process.cwd();
+
+  if (target.kind === 'pick') {
+    // `-r` with no id: our own list of this folder's conversations instead of claude's picker
+    if (!tty) return { args };
+    const rest = args.filter((_, i) => i !== target.index);
+    const out = await chooseConversation(name, rest, { canGoBack: false });
+    if (out === BACK) process.exit(0);
+    return out;
+  }
+
+  const sessions = backgroundSessions();
+  const s = target.kind === 'id'
+    ? matchSession(sessions, target.value)
+    : sessions.find(x => x.sessionId === lastSessionId(cwd));
+  if (!s) return { args };
+  console.error(yellow('⚠ ') + `${label(s)} is running in the background, under the account it was started with.`);
+  if (!tty) die(`stop it first with: claude stop ${s.id}`);
+  if (!(await confirmKey(`  Stop it and open it here as ${bold(name)}?`))) process.exit(0);
+  stopSession(s);
+  return { args };
+}
+
+// `cwd`: start claude in that folder (a conversation from another project resumes only there).
+async function launch(name, claudeArgs, { skipCheck, cwd } = {}) {
+  if (name !== OWN && !load().accounts[name]) die(`no account named "${name}". See: clauder list`);
+  if (!skipCheck) ({ args: claudeArgs, cwd } = await freeSession(name, claudeArgs));
   const env = { ...process.env };
   delete env.CLAUDE_CODE_OAUTH_TOKEN;
   const db = load();
@@ -181,10 +550,12 @@ function launch(name, claudeArgs) {
   // add the flag unless the caller already chose a permission mode
   const chosen = claudeArgs.some(a => a === BYPASS_FLAG || a.startsWith('--permission-mode'));
   if (getBypass(db, name) && !chosen) claudeArgs = [BYPASS_FLAG, ...claudeArgs];
-  console.error(`> claude (${name})` + (claudeArgs.includes(BYPASS_FLAG) ? yellow('  ⚠ bypass permissions on') : ''));
+  const where = cwd && !samePath(cwd, process.cwd()) ? dim(`  in ${cwd}`) : '';
+  console.error(`> claude (${name})` + (claudeArgs.includes(BYPASS_FLAG) ? yellow('  ⚠ bypass permissions on') : '') + where);
   const child = spawn('claude', claudeArgs, {
     stdio: 'inherit',
     env,
+    cwd: cwd || process.cwd(),
     shell: process.platform === 'win32' && !hasExe(), // npm installs use claude.cmd
   });
   child.on('error', e => die(`could not start claude: ${e.message}`));
@@ -292,6 +663,34 @@ function cmdRename(from, to) {
 
 // ---------- interactive screens ----------
 
+// Columns a character takes: 2 for East Asian wide characters and emoji, and for ⚠, which
+// Windows Terminal draws two columns wide; 1 for everything else.
+function charWidth(ch) {
+  const c = ch.codePointAt(0);
+  if (c === 0x26a0) return 2;
+  return (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3)
+    || (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60)
+    || (c >= 0xffe0 && c <= 0xffe6) || (c >= 0x1f300 && c <= 0x1faff) ? 2 : 1;
+}
+
+// Visible columns of a line with color codes.
+const visWidth = line => [...line.replace(/\x1b\[[0-9;]*m/g, '')].reduce((n, ch) => n + charWidth(ch), 0);
+
+// Cut a line with color codes to at most `max` visible columns.
+function fitWidth(line, max) {
+  let width = 0, out = '', cut = false;
+  for (const part of line.split(/(\x1b\[[0-9;]*m)/)) {
+    if (part.startsWith('\x1b[')) { out += part; continue; }
+    for (const ch of part) {
+      const w = charWidth(ch);
+      if (width + w > max) { cut = true; break; }
+      width += w; out += ch;
+    }
+    if (cut) break;
+  }
+  return cut && COLOR ? out + '\x1b[0m' : out;
+}
+
 // Redraws render() in place and feeds keys to onKey(str, key, state) until it calls state.done(value).
 // state.sel is the highlighted row; arrows, j/k, home/end and 1-9 move it.
 function interactive(count, render, onKey) {
@@ -302,12 +701,15 @@ function interactive(count, render, onKey) {
 
     const draw = () => {
       if (drawn) out.write(`\x1b[${drawn}A\x1b[J`); // back to the top of the screen, clear below
-      const lines = render(state);
+      // A line wider than the terminal wraps onto two rows, and the next redraw would not go
+      // up far enough (the old screen stays and the title repeats). So no line may wrap.
+      const lines = render(state).map(l => fitWidth(l, (out.columns || 80) - 1));
       out.write(lines.join('\n') + '\n');
       drawn = lines.length;
     };
     state.redraw = draw;
     state.done = value => {
+      if (drawn) out.write(`\x1b[${drawn}A\x1b[J`); // erase the screen so the next one starts clean
       process.stdin.removeListener('keypress', handler);
       process.stdin.setRawMode(false);
       process.stdin.pause();
@@ -402,10 +804,14 @@ async function cmdMenu() {
   if (process.stdin.isTTY && process.stdout.isTTY) {
     banner();
     console.log();
-    const choice = await pickAccount(names, db);
-    if (choice === null) return;
-    if (choice === ADD) return cmdAdd();
-    return launch(choice, []);
+    for (;;) {
+      const choice = await pickAccount(names, db);
+      if (choice === null) return;
+      if (choice === ADD) return cmdAdd();
+      const picked = await chooseConversation(choice, [], { canGoBack: true });
+      if (picked === BACK) continue; // esc: back to the account list
+      return launch(choice, picked.args, { skipCheck: true, cwd: picked.cwd });
+    }
   }
 
   // Not a terminal (piped input): numbered prompt.
@@ -429,8 +835,9 @@ async function cmdMenu() {
 function help() {
   console.log(`clauder - start Claude Code as different accounts
 
-  clauder                        pick an account from a menu and start claude
+  clauder                        pick an account, then a new or earlier conversation
   clauder <name> [claude args]   start claude with that account   (e.g. clauder alice -c)
+  clauder <name> -r              pick a conversation to continue as that account
   clauder ${OWN} [claude args]       start claude with your own login
   clauder add [name]             add a token (hidden input)
   clauder list                   list accounts and their login status

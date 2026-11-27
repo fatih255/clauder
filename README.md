@@ -24,8 +24,8 @@ To uninstall, run `npm unlink -g clauder`.
 
 ## Pick an account
 
-Run `clauder` with no arguments to get a menu. Move with the arrow keys and press Enter to start
-`claude` with that account.
+Run `clauder` with no arguments to get a menu. Move with the arrow keys and press Enter to pick
+an account, then choose a new conversation or one to continue.
 
 ![Picking an account from the menu](docs/menu.gif)
 
@@ -33,7 +33,7 @@ Run `clauder` with no arguments to get a menu. Move with the arrow keys and pres
 |---|---|
 | ↑ ↓ or j k | move (wraps around) |
 | 1 to 9 | jump to that row |
-| Enter | start `claude` with the selected account |
+| Enter | pick the selected account |
 | b | turn bypass permissions on or off for the selected account |
 | a | add an account |
 | Esc, q or Ctrl+C | quit |
@@ -46,6 +46,51 @@ clauder alice           # start claude as alice
 clauder alice -c        # continue alice's last conversation
 clauder me              # your own login, no token
 ```
+
+## Continue a conversation as another account
+
+A conversation is not tied to an account. If one account hits its usage limit, you can carry on
+the same conversation, with all of its history, as another account. From then on the usage
+counts against that account.
+
+After you pick an account in the menu, `clauder` lists your conversations from every project,
+newest first, in the style of Claude Code's own resume screen. `clauder alice -r` opens the
+same list.
+
+```
+Start claude as alice
+╭──────────────────────────────────────────────╮
+│ ⌕ Search…                                    │
+╰──────────────────────────────────────────────╯
+
+❯ New conversation
+  start fresh
+
+  Fix the login bug
+  12 minutes ago · bg · running, will be stopped · my-app · main · 286KB
+
+  Write the release notes
+  2 days ago · docs-site · main · 1.2MB
+```
+
+| Key | Action |
+|---|---|
+| ↑ ↓, Page Up, Page Down | move |
+| typing | filter by title, project folder or git branch |
+| Enter | start `claude` as that account, in the conversation's own folder |
+| Esc | clear the search, then go back to the accounts |
+
+A conversation that is still running somewhere else keeps the account it was started with, and
+`claude` refuses to open it a second time. `clauder` handles the two cases:
+
+- **Running in the background** (`claude --bg`, or a session sent to the background): marked
+  `bg`. Picking it runs `claude stop` on it first, then opens it as the account you chose, so
+  the old copy cannot start again when its own limit resets.
+- **Open in another terminal**: marked in red. `clauder` will not take it over; close it there
+  first.
+
+Passing a conversation yourself does the same check: `clauder alice --resume <id>` and
+`clauder alice -c` ask before they stop a background copy.
 
 ## Add a token
 
@@ -91,6 +136,7 @@ refuses to start with it.
 ```sh
 clauder                    # menu
 clauder <name> [args]      # start claude as <name>, passing [args] to claude
+clauder <name> -r          # pick a conversation to continue as <name>
 clauder me [args]          # start claude with your own login
 clauder add [name]         # add or replace a token
 clauder list               # accounts with their login status
