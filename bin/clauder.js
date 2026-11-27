@@ -180,7 +180,6 @@ function claudeSync(args) {
   });
 }
 
-const DONE_STATES = ['stopped', 'completed', 'done', 'failed', 'killed', 'exited'];
 
 // Background sessions that are still alive, from `claude agents --json`. [] if that fails.
 const backgroundSessions = () => activeSessions().filter(s => s.kind === 'background');
@@ -243,7 +242,8 @@ function sessionMeta(file) {
     return {
       title: (custom || ai || textOf(first)).replace(/\s+/g, ' ').trim(),
       cwd: withCwd.cwd || null,
-      branch: withCwd.gitBranch || null,
+      // "HEAD" is what claude records outside a git repo or on a detached head: says nothing
+      branch: withCwd.gitBranch && withCwd.gitBranch !== 'HEAD' ? withCwd.gitBranch : null,
     };
   } catch { return null; }
 }
@@ -275,7 +275,9 @@ function activeSessions() {
   const r = claudeSync(['agents', '--json']);
   if (r.error || r.status !== 0) return [];
   try {
-    return JSON.parse(r.stdout.slice(r.stdout.indexOf('['))).filter(s => s.sessionId && !DONE_STATES.includes(s.state));
+    // Without --all the list holds only live sessions. Don't filter on `state`: a session whose
+    // task is "done" still runs and still blocks a resume, and the field stays "done" after a stop.
+    return JSON.parse(r.stdout.slice(r.stdout.indexOf('['))).filter(s => s.sessionId);
   } catch { return []; }
 }
 
@@ -363,7 +365,8 @@ function pickSession(name, { canGoBack }) {
       }
       const foot = ['', ...help.map(l => dim(l))];
       // each conversation takes 3 rows (title, details, gap); keep the selection on screen
-      const fit = Math.max(1, Math.floor((rows - head.length - foot.length - 1) / 3));
+      // (-2: one row for the "↓ more" line, one for the cursor's line after the last newline)
+      const fit = Math.max(1, Math.floor((rows - head.length - foot.length - 2) / 3));
       if (st.sel < st.top) st.top = st.sel;
       if (st.sel >= st.top + fit) st.top = st.sel - fit + 1;
       st.top = Math.max(0, Math.min(st.top, Math.max(0, items.length - fit)));
@@ -433,7 +436,9 @@ function pickSession(name, { canGoBack }) {
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.on('exit', () => out.write('\x1b[?25h'));
-    out.write('\x1b[?25l');
+    // Start on a clean screen: the list is sized to the terminal's height, and drawn below the
+    // banner it would run off the bottom, scroll, and break the redraw.
+    out.write('\x1b[2J\x1b[H\x1b[?25l');
     process.stdin.on('keypress', onKey);
     draw();
   });
@@ -536,6 +541,17 @@ async function freeSession(name, args) {
 // `cwd`: start claude in that folder (a conversation from another project resumes only there).
 async function launch(name, claudeArgs, { skipCheck, cwd } = {}) {
   if (name !== OWN && !load().accounts[name]) die(`no account named "${name}". See: clauder list`);
+  // Background sessions run in claude's background service, which uses the login saved on this
+  // machine and ignores CLAUDE_CODE_OAUTH_TOKEN. With a saved login, `--bg` would quietly run
+  // (and bill) your own account instead of this one, so refuse. Without one, the token is used.
+  if (name !== OWN && claudeArgs.some(a => a === '--bg' || a === '--background')) {
+    const own = authStatus(null);
+    if (own && own.loggedIn) {
+      die(`--bg would not run as ${name}: background sessions use the login saved on this machine` +
+        (own.email ? ` (${own.email})` : '') + `, not ${name}'s token.\n` +
+        `Start it in the foreground instead: clauder ${name} ${claudeArgs.filter(a => a !== '--bg' && a !== '--background').map(a => (/\s/.test(a) ? `"${a}"` : a)).join(' ')}`.trimEnd());
+    }
+  }
   if (!skipCheck) ({ args: claudeArgs, cwd } = await freeSession(name, claudeArgs));
   const env = { ...process.env };
   delete env.CLAUDE_CODE_OAUTH_TOKEN;

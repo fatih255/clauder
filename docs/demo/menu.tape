@@ -9,8 +9,9 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 70ms
 
 Hide
-Type "source docs/demo/setup.sh"
+Type "source docs/demo/setup.sh && source /src/docs/demo/conversations.sh"
 Enter
+Wait@180s /^\$$/
 Show
 
 Sleep 500ms
@@ -26,5 +27,15 @@ Up
 Sleep 900ms
 Type "b"
 Sleep 1.2s
+Enter
+Sleep 2s
+Down
+Sleep 600ms
+Down
+Sleep 600ms
+Up
+Sleep 600ms
+Up
+Sleep 800ms
 Enter
 Sleep 7s

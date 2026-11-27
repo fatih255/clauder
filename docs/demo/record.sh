@@ -11,7 +11,7 @@ set -e
 
 docker build -q -t clauder-vhs - <<'EOF'
 FROM ghcr.io/charmbracelet/vhs
-RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm ca-certificates git \
  && rm -rf /var/lib/apt/lists/* && npm i -g @anthropic-ai/claude-code
 EOF
 
@@ -23,7 +23,12 @@ if [ -f "$HOME/.claude/.credentials.json" ]; then
   creds="-v $(hostpath "$HOME/.claude/.credentials.json"):/creds.json:ro"
 fi
 
-for tape in docs/demo/*.tape; do
+# all tapes, or only the ones named: sh docs/demo/record.sh docs/demo/resume.tape
+[ $# -gt 0 ] || set -- docs/demo/*.tape
+for tape in "$@"; do
+  # Your login goes only to list.tape, the one that shows `clauder me`. Elsewhere it would take
+  # over the background sessions, which use the saved login rather than the demo token.
+  c=; case "$tape" in *list.tape) c=$creds ;; esac
   # MSYS_NO_PATHCONV keeps Git Bash on Windows from rewriting the container paths
-  MSYS_NO_PATHCONV=1 docker run --rm -e CLAUDER_DEMO_TOKEN $creds -v "$(hostpath "$PWD"):/src" -w /src clauder-vhs "$tape"
+  MSYS_NO_PATHCONV=1 docker run --rm -e CLAUDER_DEMO_TOKEN $c -v "$(hostpath "$PWD"):/src" -w /src clauder-vhs "$tape"
 done

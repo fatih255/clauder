@@ -57,21 +57,10 @@ After you pick an account in the menu, `clauder` lists your conversations from e
 newest first, in the style of Claude Code's own resume screen. `clauder alice -r` opens the
 same list.
 
-```
-Start claude as alice
-╭──────────────────────────────────────────────╮
-│ ⌕ Search…                                    │
-╰──────────────────────────────────────────────╯
+Here alice left a conversation running in the background. Picking it as bob stops alice's
+copy, opens the conversation with its history, and bob carries on:
 
-❯ New conversation
-  start fresh
-
-  Fix the login bug
-  12 minutes ago · bg · running, will be stopped · my-app · main · 286KB
-
-  Write the release notes
-  2 days ago · docs-site · main · 1.2MB
-```
+![Continuing alice's background conversation as bob](docs/resume.gif)
 
 | Key | Action |
 |---|---|
@@ -91,6 +80,14 @@ A conversation that is still running somewhere else keeps the account it was sta
 
 Passing a conversation yourself does the same check: `clauder alice --resume <id>` and
 `clauder alice -c` ask before they stop a background copy.
+
+### Background sessions use your own login
+
+Claude Code runs background sessions (`claude --bg`) in a background service that uses the login
+saved on your machine and ignores the token `clauder` passes. So `clauder alice --bg` would run,
+and use the limits of, your own account rather than alice's. `clauder` refuses it when a login
+is saved and tells you to start the session in the foreground instead. Conversations you continue
+through `clauder` open in the foreground, so they do run as the account you picked.
 
 ## Add a token
 
